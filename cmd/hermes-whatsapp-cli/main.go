@@ -1,0 +1,146 @@
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+
+	"github.com/rgaona/hermes-whatsapp-kapso/internal/config"
+	"github.com/rgaona/hermes-whatsapp-kapso/internal/kapso"
+	"github.com/rgaona/hermes-whatsapp-kapso/internal/preflight"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "send":
+		handleSend(os.Args[2:])
+	case "status":
+		handleStatus()
+	case "preflight":
+		handlePreflight()
+	case "help", "--help", "-h":
+		printUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+func handleSend(args []string) {
+	var to, text string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--to":
+			if i+1 < len(args) {
+				to = args[i+1]
+				i++
+			}
+		case "--text":
+			if i+1 < len(args) {
+				text = args[i+1]
+				i++
+			}
+		default:
+			if to == "" && strings.HasPrefix(args[i], "+") {
+				to = args[i]
+			} else if text == "" {
+				text = args[i]
+			}
+		}
+	}
+
+	if to == "" || text == "" {
+		fmt.Fprintln(os.Stderr, "usage: hermes-whatsapp-cli send --to +NUMBER --text \"message\"")
+		os.Exit(1)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
+	if cfg.Kapso.APIKey == "" || cfg.Kapso.PhoneNumberID == "" {
+		fmt.Fprintln(os.Stderr, "error: KAPSO_API_KEY and KAPSO_PHONE_NUMBER_ID must be set")
+		os.Exit(1)
+	}
+
+	client := kapso.NewClient(cfg.Kapso.APIKey, cfg.Kapso.PhoneNumberID)
+	resp, err := client.SendText(to, text)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(resp.Messages) > 0 {
+		fmt.Printf("sent (id: %s)\n", resp.Messages[0].ID)
+	} else {
+		fmt.Println("sent")
+	}
+}
+
+func handleStatus() {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
+	webhookAddr := cfg.Webhook.Addr
+	if !strings.Contains(webhookAddr, "://") {
+		webhookAddr = "http://localhost" + webhookAddr
+	}
+
+	resp, err := http.Get(webhookAddr + "/health")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "webhook server unreachable: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusOK {
+		fmt.Println("webhook server: ok")
+	} else {
+		fmt.Fprintf(os.Stderr, "webhook server: unhealthy (status %d)\n", resp.StatusCode)
+		os.Exit(1)
+	}
+}
+
+func handlePreflight() {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[FAIL]  Config — %v\n", err)
+		os.Exit(1)
+	}
+	_ = cfg.Validate()
+
+	fmt.Println("Preflight checks:")
+	if err := preflight.Run(cfg, os.Stdout, nil); err != nil {
+		fmt.Fprintln(os.Stderr, "\nPreflight failed.")
+		os.Exit(1)
+	}
+	fmt.Println("\nAll checks passed.")
+}
+
+func printUsage() {
+	fmt.Println(`hermes-whatsapp-cli — Send WhatsApp messages via Kapso API (powered by Hermes Agent)
+
+Commands:
+  send --to +NUMBER --text "message"   Send a text message
+  status                                Check webhook server health
+  preflight                             Verify config, credentials, and connectivity
+  help                                  Show this help
+
+Configuration:
+  Config file: ~/.config/hermes-whatsapp/config.toml (or set HERMES_CONFIG)
+  Env vars KAPSO_API_KEY and KAPSO_PHONE_NUMBER_ID override config file values.
+  Env vars HERMES_URL and HERMES_TOKEN configure the Hermes agent connection.`)
+}

@@ -1,6 +1,6 @@
-# Binaries
-hermes-whatsapp-bridge
-hermes-whatsapp-cli
+# Binaries (only at repo root, not cmd/ subdirectories)
+/hermes-whatsapp-bridge
+/hermes-whatsapp-cli
 *.exe
 
 # Go
