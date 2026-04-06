@@ -1,0 +1,428 @@
+package config
+
+import (
+	"log"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/BurntSushi/toml"
+)
+
+// Config holds all configuration for the hermes-whatsapp bridge.
+type Config struct {
+	Kapso      KapsoConfig      `toml:"kapso"`
+	Delivery   DeliveryConfig   `toml:"delivery"`
+	Webhook    WebhookConfig    `toml:"webhook"`
+	Gateway    GatewayConfig    `toml:"gateway"`
+	State      StateConfig      `toml:"state"`
+	Security   SecurityConfig   `toml:"security"`
+	Transcribe TranscribeConfig `toml:"transcribe"`
+	Commands   CommandsConfig   `toml:"commands"`
+}
+
+// CommandsConfig holds configuration for the bridge-level command system.
+type CommandsConfig struct {
+	Prefix      string                `toml:"prefix"`
+	Timeout     int                   `toml:"timeout"`
+	Definitions map[string]CommandDef `toml:"definitions"`
+}
+
+// CommandDef defines a single bridge command.
+type CommandDef struct {
+	Type        string   `toml:"type"`
+	Description string   `toml:"description"`
+	Shell       string   `toml:"shell"`
+	Prompt      string   `toml:"prompt"`
+	Ack         string   `toml:"ack"`
+	Roles       []string `toml:"roles"`
+}
+
+// TranscribeConfig holds configuration for audio transcription providers.
+type TranscribeConfig struct {
+	Provider          string  `toml:"provider"`
+	APIKey            string  `toml:"api_key"`
+	Model             string  `toml:"model"`
+	Language          string  `toml:"language"`
+	MaxAudioSize      int64   `toml:"max_audio_size"`
+	BinaryPath        string  `toml:"binary_path"`
+	ModelPath         string  `toml:"model_path"`
+	Timeout           int     `toml:"timeout"`
+	NoSpeechThreshold float64 `toml:"no_speech_threshold"`
+	CacheTTL          int     `toml:"cache_ttl"`
+	Debug             bool    `toml:"debug"`
+}
+
+type KapsoConfig struct {
+	APIKey        string `toml:"api_key"`
+	PhoneNumberID string `toml:"phone_number_id"`
+}
+
+type DeliveryConfig struct {
+	Mode         string `toml:"mode"`
+	PollInterval int    `toml:"poll_interval"`
+	PollFallback bool   `toml:"poll_fallback"`
+}
+
+type WebhookConfig struct {
+	Addr        string `toml:"addr"`
+	VerifyToken string `toml:"verify_token"`
+	Secret      string `toml:"secret"`
+}
+
+// GatewayConfig holds configuration for the Hermes agent gateway.
+type GatewayConfig struct {
+	URL          string `toml:"url"`           // HTTP base URL of the hermes-agent API server
+	Token        string `toml:"token"`         // Optional Bearer token for API authentication
+	Model        string `toml:"model"`         // Model name to send in chat completions (default: "hermes-agent")
+	SystemPrompt string `toml:"system_prompt"` // Optional system prompt prepended to conversations
+	SessionKey   string `toml:"session_key"`   // Base session key for X-Hermes-Session-Id header
+	ErrorMessage string `toml:"error_message"` // Sent to WhatsApp when agent fails
+}
+
+type StateConfig struct {
+	Dir string `toml:"dir"`
+}
+
+type SecurityConfig struct {
+	Mode             string              `toml:"mode"`
+	Roles            map[string][]string `toml:"roles"`
+	DenyMessage      string              `toml:"deny_message"`
+	RateLimit        int                 `toml:"rate_limit"`
+	RateWindow       int                 `toml:"rate_window"`
+	SessionIsolation bool                `toml:"session_isolation"`
+	DefaultRole      string              `toml:"default_role"`
+}
+
+func defaults() Config {
+	home := os.Getenv("HOME")
+	return Config{
+		Delivery: DeliveryConfig{
+			Mode:         "polling",
+			PollInterval: 30,
+		},
+		Webhook: WebhookConfig{
+			Addr: ":18790",
+		},
+		Gateway: GatewayConfig{
+			URL:          "http://127.0.0.1:8642",
+			Model:        "hermes-agent",
+			SessionKey:   "main",
+			ErrorMessage: "Sorry, I ran into an issue processing your message. Please try again in a moment.",
+		},
+		State: StateConfig{
+			Dir: filepath.Join(home, ".config", "hermes-whatsapp"),
+		},
+		Security: SecurityConfig{
+			Mode:             "allowlist",
+			DenyMessage:      "Sorry, you are not authorized to use this service.",
+			RateLimit:        10,
+			RateWindow:       60,
+			SessionIsolation: true,
+			DefaultRole:      "member",
+		},
+		Transcribe: TranscribeConfig{
+			MaxAudioSize:      25 * 1024 * 1024,
+			BinaryPath:        "whisper-cli",
+			Timeout:           30,
+			NoSpeechThreshold: 0.85,
+			CacheTTL:          3600,
+			Debug:             false,
+		},
+	}
+}
+
+// Load reads configuration from the TOML config file (if it exists) and
+// applies environment variable overrides. Env vars always win.
+func Load() (*Config, error) {
+	cfg := defaults()
+
+	path := configPath()
+	if path != "" {
+		if _, err := os.Stat(path); err == nil {
+			if _, err := toml.DecodeFile(path, &cfg); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	applyEnv(&cfg)
+	expandPaths(&cfg)
+	return &cfg, nil
+}
+
+func configPath() string {
+	if p := os.Getenv("HERMES_CONFIG"); p != "" {
+		return expandHome(p)
+	}
+	// Legacy fallback
+	if p := os.Getenv("KAPSO_CONFIG"); p != "" {
+		return expandHome(p)
+	}
+	home := os.Getenv("HOME")
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".config", "hermes-whatsapp", "config.toml")
+}
+
+func applyEnv(cfg *Config) {
+	if v := os.Getenv("KAPSO_API_KEY"); v != "" {
+		cfg.Kapso.APIKey = v
+	}
+	if v := os.Getenv("KAPSO_PHONE_NUMBER_ID"); v != "" {
+		cfg.Kapso.PhoneNumberID = v
+	}
+
+	if v := os.Getenv("KAPSO_MODE"); v != "" {
+		cfg.Delivery.Mode = resolveMode(v, "")
+	} else if v := os.Getenv("KAPSO_WEBHOOK_MODE"); v != "" {
+		cfg.Delivery.Mode = resolveMode("", v)
+	}
+	if v := os.Getenv("KAPSO_POLL_INTERVAL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Delivery.PollInterval = n
+		}
+	}
+	if v := os.Getenv("KAPSO_POLL_FALLBACK"); v != "" {
+		cfg.Delivery.PollFallback = v == "true"
+	}
+
+	if v := os.Getenv("KAPSO_WEBHOOK_ADDR"); v != "" {
+		cfg.Webhook.Addr = v
+	}
+	if v := os.Getenv("KAPSO_WEBHOOK_VERIFY_TOKEN"); v != "" {
+		cfg.Webhook.VerifyToken = v
+	}
+	if v := os.Getenv("KAPSO_WEBHOOK_SECRET"); v != "" {
+		cfg.Webhook.Secret = v
+	}
+
+	// Hermes gateway overrides.
+	if v := os.Getenv("HERMES_URL"); v != "" {
+		cfg.Gateway.URL = v
+	}
+	if v := os.Getenv("HERMES_TOKEN"); v != "" {
+		cfg.Gateway.Token = v
+	}
+	if v := os.Getenv("HERMES_MODEL"); v != "" {
+		cfg.Gateway.Model = v
+	}
+	if v := os.Getenv("HERMES_SYSTEM_PROMPT"); v != "" {
+		cfg.Gateway.SystemPrompt = v
+	}
+	if v := os.Getenv("HERMES_SESSION_KEY"); v != "" {
+		cfg.Gateway.SessionKey = v
+	}
+	if v := os.Getenv("HERMES_ERROR_MESSAGE"); v != "" {
+		cfg.Gateway.ErrorMessage = v
+	}
+	// Legacy gateway env vars for backwards compat.
+	if v := os.Getenv("GATEWAY_URL"); v != "" {
+		cfg.Gateway.URL = v
+	}
+	if v := os.Getenv("GATEWAY_TOKEN"); v != "" {
+		cfg.Gateway.Token = v
+	}
+	if v := os.Getenv("GATEWAY_ERROR_MESSAGE"); v != "" {
+		cfg.Gateway.ErrorMessage = v
+	}
+
+	if v := os.Getenv("KAPSO_STATE_DIR"); v != "" {
+		cfg.State.Dir = v
+	}
+
+	// Security overrides.
+	if v := os.Getenv("KAPSO_SECURITY_MODE"); v != "" {
+		cfg.Security.Mode = v
+	}
+	if v := os.Getenv("KAPSO_DENY_MESSAGE"); v != "" {
+		cfg.Security.DenyMessage = v
+	}
+	if v := os.Getenv("KAPSO_RATE_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Security.RateLimit = n
+		}
+	}
+	if v := os.Getenv("KAPSO_RATE_WINDOW"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Security.RateWindow = n
+		}
+	}
+	if v := os.Getenv("KAPSO_SESSION_ISOLATION"); v != "" {
+		cfg.Security.SessionIsolation = v == "true"
+	}
+	if v := os.Getenv("KAPSO_DEFAULT_ROLE"); v != "" {
+		cfg.Security.DefaultRole = v
+	}
+	if v := os.Getenv("KAPSO_ALLOWED_NUMBERS"); v != "" {
+		nums := strings.Split(v, ",")
+		role := cfg.Security.DefaultRole
+		if cfg.Security.Roles == nil {
+			cfg.Security.Roles = make(map[string][]string)
+		}
+		for _, n := range nums {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			if !phoneInRoles(cfg.Security.Roles, n) {
+				cfg.Security.Roles[role] = append(cfg.Security.Roles[role], n)
+			}
+		}
+	}
+
+	// Transcribe overrides.
+	if v := os.Getenv("KAPSO_TRANSCRIBE_PROVIDER"); v != "" {
+		cfg.Transcribe.Provider = strings.ToLower(v)
+	}
+	if v := os.Getenv("KAPSO_TRANSCRIBE_API_KEY"); v != "" {
+		cfg.Transcribe.APIKey = v
+	}
+	if v := os.Getenv("KAPSO_TRANSCRIBE_MODEL"); v != "" {
+		cfg.Transcribe.Model = v
+	}
+	if v := os.Getenv("KAPSO_TRANSCRIBE_LANGUAGE"); v != "" {
+		cfg.Transcribe.Language = v
+	}
+	if v := os.Getenv("KAPSO_TRANSCRIBE_MAX_AUDIO_SIZE"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.Transcribe.MaxAudioSize = n
+		}
+	}
+	if v := os.Getenv("KAPSO_TRANSCRIBE_BINARY_PATH"); v != "" {
+		cfg.Transcribe.BinaryPath = v
+	}
+	if v := os.Getenv("KAPSO_TRANSCRIBE_MODEL_PATH"); v != "" {
+		cfg.Transcribe.ModelPath = v
+	}
+	if v := os.Getenv("KAPSO_TRANSCRIBE_DEBUG"); v != "" {
+		cfg.Transcribe.Debug = v == "true"
+	}
+	if v := os.Getenv("KAPSO_TRANSCRIBE_NO_SPEECH_THRESHOLD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.Transcribe.NoSpeechThreshold = f
+		}
+	}
+	if v := os.Getenv("KAPSO_TRANSCRIBE_CACHE_TTL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Transcribe.CacheTTL = n
+		}
+	}
+}
+
+func resolveMode(mode, legacyMode string) string {
+	switch strings.ToLower(mode) {
+	case "polling", "tailscale", "domain":
+		return strings.ToLower(mode)
+	}
+
+	switch strings.ToLower(legacyMode) {
+	case "webhook", "both":
+		return "domain"
+	}
+
+	return "polling"
+}
+
+// Validate checks that required fields are set for the configured mode.
+func (c *Config) Validate() error {
+	if c.Delivery.PollInterval < 5 {
+		c.Delivery.PollInterval = 30
+	}
+
+	mode := strings.ToLower(c.Delivery.Mode)
+	switch mode {
+	case "polling", "tailscale", "domain":
+		c.Delivery.Mode = mode
+	default:
+		c.Delivery.Mode = "polling"
+	}
+
+	switch c.Security.Mode {
+	case "allowlist", "open":
+	default:
+		c.Security.Mode = "allowlist"
+	}
+
+	if c.Security.RateLimit < 1 {
+		c.Security.RateLimit = 1
+	}
+	if c.Security.RateWindow < 10 {
+		c.Security.RateWindow = 10
+	}
+
+	if c.Security.Mode == "allowlist" {
+		total := 0
+		for _, nums := range c.Security.Roles {
+			total += len(nums)
+		}
+		if total == 0 {
+			log.Printf("warning: security mode is \"allowlist\" but no numbers configured — all messages will be rejected")
+		}
+	}
+
+	seen := make(map[string]string)
+	for role, nums := range c.Security.Roles {
+		for _, phone := range nums {
+			if prev, exists := seen[phone]; exists {
+				log.Printf("warning: phone %s appears in both roles %q and %q — %q wins", phone, prev, role, prev)
+			} else {
+				seen[phone] = role
+			}
+		}
+	}
+
+	// Gateway validation.
+	if c.Gateway.Model == "" {
+		c.Gateway.Model = "hermes-agent"
+	}
+	if c.Gateway.SessionKey == "" {
+		c.Gateway.SessionKey = "main"
+	}
+
+	if c.Transcribe.MaxAudioSize <= 0 {
+		c.Transcribe.MaxAudioSize = 25 * 1024 * 1024
+	}
+	if c.Transcribe.CacheTTL <= 0 {
+		c.Transcribe.CacheTTL = 3600
+	}
+
+	if len(c.Commands.Definitions) > 0 {
+		if c.Commands.Prefix == "" {
+			c.Commands.Prefix = "!"
+		}
+		if c.Commands.Timeout <= 0 {
+			c.Commands.Timeout = 30
+		}
+	}
+
+	return nil
+}
+
+func phoneInRoles(roles map[string][]string, phone string) bool {
+	for _, nums := range roles {
+		for _, n := range nums {
+			if n == phone {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func expandPaths(cfg *Config) {
+	cfg.State.Dir = expandHome(cfg.State.Dir)
+	cfg.Transcribe.BinaryPath = expandHome(cfg.Transcribe.BinaryPath)
+	cfg.Transcribe.ModelPath = expandHome(cfg.Transcribe.ModelPath)
+}
+
+func expandHome(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		if home := os.Getenv("HOME"); home != "" {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
+}

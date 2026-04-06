@@ -1,0 +1,246 @@
+package webhook
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/rgaona/hermes-whatsapp-kapso/internal/delivery"
+	"github.com/rgaona/hermes-whatsapp-kapso/internal/kapso"
+	"github.com/rgaona/hermes-whatsapp-kapso/internal/transcribe"
+)
+
+// Server is an HTTP webhook receiver that implements delivery.Source.
+type Server struct {
+	Addr         string
+	VerifyToken  string
+	AppSecret    string
+	Client       *kapso.Client
+	Transcriber  transcribe.Transcriber
+	MaxAudioSize int64
+}
+
+// Run starts the webhook HTTP server and emits events on out.
+func (s *Server) Run(ctx context.Context, out chan<- delivery.Event) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/webhook", s.webhookHandler(out))
+	mux.HandleFunc("/health", handleHealth)
+
+	srv := &http.Server{
+		Addr:              s.Addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	ln, err := net.Listen("tcp", s.Addr)
+	if err != nil {
+		return fmt.Errorf("webhook listen: %w", err)
+	}
+	log.Printf("webhook server listening on %s", ln.Addr())
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("webhook serve: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) webhookHandler(out chan<- delivery.Event) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			s.handleVerification(w, r)
+		case http.MethodPost:
+			s.handleEvent(w, r, out)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+func (s *Server) handleVerification(w http.ResponseWriter, r *http.Request) {
+	mode := r.URL.Query().Get("hub.mode")
+	token := r.URL.Query().Get("hub.verify_token")
+	challenge := r.URL.Query().Get("hub.challenge")
+
+	if mode == "subscribe" && token == s.VerifyToken {
+		log.Printf("webhook verification successful")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, challenge)
+		return
+	}
+
+	log.Printf("webhook verification failed: mode=%q token_match=%v", mode, token == s.VerifyToken)
+	http.Error(w, "verification failed", http.StatusForbidden)
+}
+
+type webhookFormat int
+
+const (
+	formatUnknown webhookFormat = iota
+	formatMeta
+	formatKapso
+)
+
+func detectFormat(body []byte) webhookFormat {
+	var probe struct {
+		Type   string `json:"type"`
+		Object string `json:"object"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return formatUnknown
+	}
+	if probe.Type != "" {
+		return formatKapso
+	}
+	if probe.Object != "" {
+		return formatMeta
+	}
+	return formatUnknown
+}
+
+func formatName(f webhookFormat) string {
+	switch f {
+	case formatKapso:
+		return "kapso-native"
+	case formatMeta:
+		return "meta"
+	default:
+		return "unknown"
+	}
+}
+
+func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request, out chan<- delivery.Event) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+
+	if s.AppSecret != "" {
+		if !validateSignature(r.Header, body, s.AppSecret) {
+			log.Printf("webhook: invalid signature")
+			http.Error(w, "invalid signature", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	format := detectFormat(body)
+	log.Printf("webhook: detected %s format", formatName(format))
+
+	w.WriteHeader(http.StatusOK)
+
+	switch format {
+	case formatKapso:
+		s.handleKapsoPayload(body, out)
+	case formatMeta:
+		s.handleMetaPayload(body, out)
+	default:
+		log.Printf("webhook: unrecognized payload format, ignoring")
+	}
+}
+
+func (s *Server) handleMetaPayload(body []byte, out chan<- delivery.Event) {
+	var payload kapso.WebhookPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		log.Printf("webhook: invalid Meta JSON: %v", err)
+		return
+	}
+
+	for _, entry := range payload.Entry {
+		for _, change := range entry.Changes {
+			if change.Field != "messages" {
+				continue
+			}
+
+			contacts := make(map[string]string)
+			for _, c := range change.Value.Contacts {
+				contacts[c.WaID] = c.Profile.Name
+			}
+
+			for _, msg := range change.Value.Messages {
+				s.emitMessage(msg, contacts, out)
+			}
+		}
+	}
+}
+
+func (s *Server) handleKapsoPayload(body []byte, out chan<- delivery.Event) {
+	var payload kapso.KapsoWebhookPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		log.Printf("webhook: invalid Kapso JSON: %v", err)
+		return
+	}
+
+	if payload.Type != "whatsapp.message.received" {
+		log.Printf("webhook: ignoring Kapso event type %q", payload.Type)
+		return
+	}
+
+	for _, item := range payload.Data {
+		s.emitMessage(item.Message, nil, out)
+	}
+}
+
+func (s *Server) emitMessage(msg kapso.Message, contacts map[string]string, out chan<- delivery.Event) {
+	text, ok := delivery.ExtractText(msg, s.Client, s.Transcriber, s.MaxAudioSize)
+	if !ok {
+		return
+	}
+
+	name := ""
+	if msg.Kapso != nil && msg.Kapso.ContactName != "" {
+		name = msg.Kapso.ContactName
+	} else if contacts != nil {
+		name = contacts[msg.From]
+	}
+
+	out <- delivery.Event{
+		ID:   msg.ID,
+		From: msg.From,
+		Name: name,
+		Text: text,
+	}
+	log.Printf("webhook: received message %s from %s", msg.ID, msg.From)
+}
+
+func validateSignature(headers http.Header, body []byte, secret string) bool {
+	if sig := headers.Get("X-Webhook-Signature"); sig != "" {
+		return hmacValid(body, sig, secret)
+	}
+	if sig := headers.Get("X-Hub-Signature-256"); sig != "" {
+		return hmacValid(body, strings.TrimPrefix(sig, "sha256="), secret)
+	}
+	return false
+}
+
+func hmacValid(body []byte, hexSig, secret string) bool {
+	if hexSig == "" {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	expected := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(hexSig), []byte(expected))
+}
+
+func handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprint(w, "ok")
+}
