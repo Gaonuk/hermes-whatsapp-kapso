@@ -52,6 +52,33 @@ bash <(curl -s https://install.nous.ai/hermes)
 hermes setup
 ```
 
+### 3. Enable the API server
+
+The Hermes API server exposes hermes-agent as an OpenAI-compatible HTTP endpoint. It is **not enabled by default** — the bridge needs it to communicate with the agent.
+
+Add to `~/.hermes/.env`:
+
+```bash
+API_SERVER_ENABLED=true
+API_SERVER_KEY=change-me-local-dev
+# Optional: only if a browser must call Hermes directly
+# API_SERVER_CORS_ORIGINS=http://localhost:3000
+```
+
+If you set `API_SERVER_KEY`, pass the same value as `HERMES_TOKEN` when configuring the bridge.
+
+### 4. Start the gateway
+
+```bash
+hermes gateway
+```
+
+You should see:
+
+```
+[API Server] API server listening on http://127.0.0.1:8642
+```
+
 If running on a headless server, enable linger so the gateway service persists:
 
 ```bash
@@ -65,7 +92,7 @@ Verify hermes-agent is running:
 curl http://127.0.0.1:8642/health
 ```
 
-### 3. Install the bridge
+### 5. Install the bridge
 
 ```bash
 # Install Go if not present
@@ -79,13 +106,13 @@ go build ./cmd/hermes-whatsapp-bridge
 go build ./cmd/hermes-whatsapp-cli
 ```
 
-### 4. Get your Kapso credentials
+### 6. Get your Kapso credentials
 
 From [kapso.ai](https://kapso.ai):
 - **API Key** — found in your account settings
 - **Phone Number ID** — the WhatsApp phone number ID linked to your account
 
-### 5. Generate a webhook verify token
+### 7. Generate a webhook verify token
 
 ```bash
 openssl rand -hex 32
@@ -93,7 +120,7 @@ openssl rand -hex 32
 
 Save this — you'll set it as `KAPSO_WEBHOOK_VERIFY_TOKEN` and paste it in Kapso when registering the webhook.
 
-### 6. Configure and run
+### 8. Configure and run
 
 ```bash
 export KAPSO_API_KEY="your-kapso-api-key"
@@ -115,7 +142,7 @@ register this webhook URL in Kapso: https://your-vps.tailXXXXX.ts.net/webhook
 webhook server listening on [::]:18790
 ```
 
-### 7. Register the webhook in Kapso
+### 9. Register the webhook in Kapso
 
 In Kapso's dashboard:
 1. Go to webhook settings
@@ -129,11 +156,11 @@ export KAPSO_WEBHOOK_SECRET="the-secret-kapso-gave-you"
 
 Then restart the bridge with all env vars set.
 
-### 8. Test it
+### 10. Test it
 
 Send a WhatsApp message to your Kapso number. You should see the message flow through in the bridge logs and get a reply from hermes-agent.
 
-### 9. Run as a background service (recommended)
+### 11. Run as a background service (recommended)
 
 Instead of running the bridge in the foreground, install it as a systemd user service so it runs in the background, auto-restarts on failure, and survives reboots:
 
