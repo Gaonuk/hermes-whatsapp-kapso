@@ -1,0 +1,24 @@
+[Unit]
+Description=Hermes WhatsApp Bridge
+Documentation=https://github.com/Gaonuk/hermes-whatsapp-kapso
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hermes-whatsapp-bridge
+EnvironmentFile=%h/.config/hermes-whatsapp/env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/hermes-whatsapp
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

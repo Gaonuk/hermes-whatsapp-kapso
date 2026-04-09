@@ -133,6 +133,37 @@ Then restart the bridge with all env vars set.
 
 Send a WhatsApp message to your Kapso number. You should see the message flow through in the bridge logs and get a reply from hermes-agent.
 
+### 9. Run as a background service (recommended)
+
+Instead of running the bridge in the foreground, install it as a systemd user service so it runs in the background, auto-restarts on failure, and survives reboots:
+
+```bash
+# Install the service
+./scripts/install-service.sh
+
+# Edit your env file with your credentials
+nano ~/.config/hermes-whatsapp/env
+
+# Start it
+systemctl --user start hermes-whatsapp-bridge
+
+# Check status
+systemctl --user status hermes-whatsapp-bridge
+
+# View logs (live)
+journalctl --user -u hermes-whatsapp-bridge -f
+
+# Enable linger so it survives reboots
+sudo loginctl enable-linger $USER
+```
+
+To stop or restart:
+
+```bash
+systemctl --user stop hermes-whatsapp-bridge
+systemctl --user restart hermes-whatsapp-bridge
+```
+
 ## Quick start (polling mode)
 
 If you don't need webhooks, polling mode works with zero networking setup:
